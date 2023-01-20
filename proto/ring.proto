@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package ring;
+
+service Ring {
+    rpc SetPrev(SetHostRequest) returns (SetHostResponse);
+    rpc SetNext(SetHostRequest) returns (SetHostResponse);
+    rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message SetHostRequest {
+    string host = 1;
+}
+
+message SetHostResponse {
+}
+
+message JoinRequest {
+    string host = 1;
+}
+
+message JoinResponse {
+}
