@@ -20,4 +20,5 @@ message JoinRequest {
 }
 
 message JoinResponse {
+    string host = 1;
 }
