@@ -1,15 +1,20 @@
 use std::env;
 use std::fmt::format;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::RwLock;
+use std::ptr::addr_of_mut;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
 
 use clap::Parser;
 use futures::executor::block_on;
 use log::info;
 use ring::ring_client::RingClient;
-use ring::ring_server::{Ring, RingServer};
+use ring::ring_server::RingServer;
 use ring::{JoinRequest, JoinResponse, SetHostRequest, SetHostResponse};
 use tonic::client;
+use tonic::codegen::http::header::IntoHeaderName;
+use tonic::transport::Channel;
 use tonic::{transport::Server, Request, Response, Status};
 
 pub mod ring {
@@ -17,39 +22,45 @@ pub mod ring {
 }
 
 #[derive(Debug)]
-pub struct MyRing {
-    addr: RwLock<SocketAddr>,
+pub struct Connection {
     next_addr: RwLock<SocketAddr>,
     prev_addr: RwLock<SocketAddr>,
+    // next_con: Mutex<RingClient<Channel>>,
+    // prev_con: Mutex<RingClient<Channel>>,
 }
 
-impl MyRing {
-    pub fn new(address: SocketAddr) -> MyRing {
-        MyRing {
+#[derive(Debug)]
+pub struct Ring {
+    addr: RwLock<SocketAddr>,
+    connection: Arc<Connection>,
+}
+
+impl Ring {
+    pub fn new(address: SocketAddr, connection: Arc<Connection>) -> Ring {
+        Ring {
             addr: RwLock::new(address),
-            next_addr: RwLock::new(address),
-            prev_addr: RwLock::new(address),
+            connection: connection,
         }
     }
 
     pub async fn join(&self, next_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        *self.next_addr.write().unwrap() = next_addr;
-        let addr = format!("http://{}", &self.next_addr.read().unwrap());
+        *self.connection.next_addr.write().await = next_addr;
+        let addr = format!("http://{}", &self.connection.next_addr.read().await);
         let mut next = RingClient::connect(addr).await.unwrap();
 
         let req = tonic::Request::new(JoinRequest {
-            host: self.addr.read().unwrap().to_string(),
+            host: self.addr.read().await.to_string(),
         });
         let res = next.join(req).await?;
 
         info!("join rpc response: {:?}", res);
 
-        *self.prev_addr.write().unwrap() = res.into_inner().host.parse().unwrap();
+        *self.connection.prev_addr.write().await = res.into_inner().host.parse().unwrap();
 
         info!(
             "prev: {}, next {}",
-            self.prev_addr.read().unwrap(),
-            self.next_addr.read().unwrap()
+            self.connection.prev_addr.read().await,
+            self.connection.next_addr.read().await
         );
 
         Ok(())
@@ -57,7 +68,7 @@ impl MyRing {
 }
 
 #[tonic::async_trait]
-impl Ring for MyRing {
+impl ring::ring_server::Ring for Ring {
     async fn set_next(
         &self,
         request: Request<SetHostRequest>,
@@ -65,14 +76,15 @@ impl Ring for MyRing {
         info!("set_next rpc called: {:?}", request);
 
         let r = request.into_inner();
-        *self.next_addr.write().unwrap() = r.host.parse().unwrap();
+        *self.connection.next_addr.write().await = r.host.parse().unwrap();
+        *self.connection.next_addr.write().await = r.host.parse().unwrap();
 
         let reply = SetHostResponse {};
 
         info!(
             "prev: {}, next {}",
-            self.prev_addr.read().unwrap(),
-            self.next_addr.read().unwrap()
+            self.connection.prev_addr.read().await,
+            self.connection.next_addr.read().await
         );
 
         Ok(Response::new(reply))
@@ -86,12 +98,12 @@ impl Ring for MyRing {
         let reply = SetHostResponse {};
 
         let r = request.into_inner();
-        *self.prev_addr.write().unwrap() = r.host.parse().unwrap();
+        *self.connection.prev_addr.write().await = r.host.parse().unwrap();
 
         info!(
             "prev: {}, next {}",
-            self.prev_addr.read().unwrap(),
-            self.next_addr.read().unwrap()
+            self.connection.prev_addr.read().await,
+            self.connection.next_addr.read().await
         );
 
         Ok(Response::new(reply))
@@ -99,7 +111,7 @@ impl Ring for MyRing {
 
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
         info!("join rpc called: {:?}", request);
-        let addr = format!("http://{}", &self.prev_addr.read().unwrap());
+        let addr = format!("http://{}", &self.connection.prev_addr.read().await);
 
         let mut prev = RingClient::connect(addr).await.unwrap();
         let next_addr: SocketAddr = request.into_inner().host.clone().parse().unwrap();
@@ -111,15 +123,15 @@ impl Ring for MyRing {
         let _ = prev.set_next(req).await;
 
         let reply = JoinResponse {
-            host: self.prev_addr.read().unwrap().to_string(),
+            host: self.connection.prev_addr.read().await.to_string(),
         };
 
-        *self.prev_addr.write().unwrap() = next_addr;
+        *self.connection.prev_addr.write().await = next_addr;
 
         info!(
             "prev: {}, next {}",
-            self.prev_addr.read().unwrap(),
-            self.next_addr.read().unwrap()
+            self.connection.prev_addr.read().await,
+            self.connection.next_addr.read().await
         );
         Ok(Response::new(reply))
     }
@@ -140,7 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("params: {:?}", args);
 
     let addr = args.addr.parse().unwrap();
-    let manager = MyRing::new(addr);
+
+    let con = Arc::new(Connection {
+        next_addr: RwLock::new(addr),
+        prev_addr: RwLock::new(addr),
+    });
+
+    let manager = Ring::new(addr, con.clone());
 
     match args.next_addr {
         Some(next_addr) => {
